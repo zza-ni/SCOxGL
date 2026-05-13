@@ -6,6 +6,8 @@ from email.message import EmailMessage
 from typing import Dict, List, Tuple
 
 import streamlit as st
+from google import genai
+from google.genai import types
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -99,14 +101,59 @@ def yellow_layer(user_input: str) -> Tuple[bool, str]:
     return False, ""
 
 
-def call_main_llm_mock(user_input: str, safety_mode: bool = False) -> str:
+def get_gemini_api_key() -> str:
     """
-    실제 LLM API 연결 전 단계의 mock 함수.
-    발표 안정성을 위해 위험한 절차형 내용은 생성하지 않는다.
+    Streamlit Cloud에서는 st.secrets를 우선 사용하고,
+    로컬 실행에서는 환경변수(os.getenv)를 fallback으로 사용한다.
     """
-    if safety_mode:
-        return "요청하신 내용은 안전상 구체적 절차 대신 일반적 예방·법적 유의사항 중심으로 안내합니다."
-    return f"'{user_input}'에 대한 일반 답변입니다."
+    return st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+
+
+def call_main_llm(user_input: str, safety_mode: bool = False) -> str:
+    """
+    Gemini API를 사용하는 실제 메인 LLM 호출 함수.
+    API 키가 없거나 호출에 실패하면 데모가 멈추지 않도록 안전한 fallback 응답을 반환한다.
+    """
+    api_key = get_gemini_api_key()
+    if not api_key:
+        if safety_mode:
+            return "[LLM FALLBACK] 안전 모드: 구체적 절차 대신 일반적 예방·법적 유의사항 중심으로 안내합니다."
+        return f"[LLM FALLBACK] '{user_input}'에 대한 일반 답변입니다. GEMINI_API_KEY가 설정되면 실제 LLM 응답으로 대체됩니다."
+
+    try:
+        client = genai.Client(api_key=api_key)
+        temperature = 0.1 if safety_mode else 0.7
+        max_output_tokens = 80 if safety_mode else 350
+
+        system_instruction = (
+            "You are a safe and concise Korean AI assistant for an academic demo. "
+            "Do not provide procedural, operational, or actionable details for harmful, illegal, or violent activity. "
+            "If the user request is risky, provide only high-level safety, legal, or prevention-oriented guidance."
+        )
+
+        prompt = (
+            f"System instruction:\n{system_instruction}\n\n"
+            f"User input:\n{user_input}\n\n"
+            "Answer in Korean. Keep the response concise."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            ),
+        )
+
+        if getattr(response, "text", None):
+            return response.text
+        return "[LLM FALLBACK] Gemini 응답이 비어 있어 안전한 기본 응답을 반환합니다."
+
+    except Exception as e:
+        if safety_mode:
+            return "[LLM ERROR FALLBACK] 안전 모드: 구체적 절차 대신 일반적 예방·법적 유의사항 중심으로 안내합니다."
+        return f"[LLM ERROR FALLBACK] Gemini 호출 실패: {e}"
 
 
 def orange_layer(user_input: str, raw_response: str) -> Tuple[str, str]:
@@ -123,7 +170,7 @@ def orange_layer(user_input: str, raw_response: str) -> Tuple[str, str]:
     if semantic_risk:
         return (
             "⚠️ [ORANGE] 위험 범주와의 유사성이 감지되어 정보 밀도 제어 모드로 답변합니다.\n"
-            + call_main_llm_mock(user_input, safety_mode=True),
+            + call_main_llm(user_input, safety_mode=True),
             "DENSITY_CONTROL"
         )
 
@@ -133,6 +180,17 @@ def orange_layer(user_input: str, raw_response: str) -> Tuple[str, str]:
 # =========================
 # 4. Report + Email
 # =========================
+
+def get_email_config() -> Dict[str, str]:
+    """
+    Streamlit Cloud에서는 st.secrets를 우선 사용하고,
+    로컬 실행에서는 환경변수(os.getenv)를 fallback으로 사용한다.
+    """
+    return {
+        "sender": st.secrets.get("DEMO_EMAIL_SENDER", os.getenv("DEMO_EMAIL_SENDER", "")),
+        "password": st.secrets.get("DEMO_EMAIL_PASSWORD", os.getenv("DEMO_EMAIL_PASSWORD", "")),
+        "receiver": st.secrets.get("DEMO_EMAIL_RECEIVER", os.getenv("DEMO_EMAIL_RECEIVER", "")),
+    }
 
 def generate_report(state: SessionState) -> str:
     file_name = f"Risk_Report_{state.session_id}_{int(time.time())}.pdf"
@@ -190,13 +248,16 @@ def generate_report(state: SessionState) -> str:
 
 def send_demo_email(report_path: str) -> Tuple[bool, str]:
     """
-    환경변수 필요:
+    Streamlit Cloud에서는 Secrets 사용:
     DEMO_EMAIL_SENDER, DEMO_EMAIL_PASSWORD, DEMO_EMAIL_RECEIVER
+
+    로컬 실행에서는 동일한 이름의 환경변수를 fallback으로 사용한다.
     Gmail은 일반 비밀번호가 아니라 앱 비밀번호 사용 권장.
     """
-    sender = os.getenv("DEMO_EMAIL_SENDER")
-    password = os.getenv("DEMO_EMAIL_PASSWORD")
-    receiver = os.getenv("DEMO_EMAIL_RECEIVER")
+    email_config = get_email_config()
+    sender = email_config["sender"]
+    password = email_config["password"]
+    receiver = email_config["receiver"]
 
     if not sender or not password or not receiver:
         return False, "이메일 환경변수가 설정되지 않아 전송은 생략했습니다. PDF 생성은 완료되었습니다."
@@ -259,7 +320,7 @@ def process_user_message(user_input: str, state: SessionState) -> str:
     state.cumulative_score = DECAY * state.cumulative_score + turn_score
 
     # ORANGE
-    raw_response = call_main_llm_mock(user_input)
+    raw_response = call_main_llm(user_input)
     final_response, action = orange_layer(user_input, raw_response)
 
     layer = "ORANGE" if action != "PASS" else "GREEN"
