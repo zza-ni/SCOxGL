@@ -16,6 +16,7 @@ from reportlab.pdfgen import canvas
 # 1. Demo Configuration
 # =========================
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 THRESHOLD = 18.0
 DECAY = 0.85
 REPORT_DIR = "reports"
@@ -109,6 +110,14 @@ def get_gemini_api_key() -> str:
     return st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 
+def get_gemini_model() -> str:
+    """
+    Streamlit Cloud Secrets 또는 로컬 환경변수에서 모델명을 읽는다.
+    지정하지 않으면 비용이 낮고 빠른 Flash-Lite 계열을 기본값으로 사용한다.
+    """
+    return st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+
+
 def call_main_llm(user_input: str, safety_mode: bool = False) -> str:
     """
     Gemini API를 사용하는 실제 메인 LLM 호출 함수.
@@ -122,8 +131,9 @@ def call_main_llm(user_input: str, safety_mode: bool = False) -> str:
 
     try:
         client = genai.Client(api_key=api_key)
+        model_name = get_gemini_model()
         temperature = 0.1 if safety_mode else 0.7
-        max_output_tokens = 80 if safety_mode else 350
+        max_output_tokens = 80 if safety_mode else 300
 
         system_instruction = (
             "You are a safe and concise Korean AI assistant for an academic demo. "
@@ -133,12 +143,12 @@ def call_main_llm(user_input: str, safety_mode: bool = False) -> str:
 
         prompt = (
             f"System instruction:\n{system_instruction}\n\n"
-            f"User input:\n{user_input}\n\n"
+            f"User input:\n{user_input[:1200]}\n\n"
             "Answer in Korean. Keep the response concise."
         )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=temperature,
@@ -151,9 +161,14 @@ def call_main_llm(user_input: str, safety_mode: bool = False) -> str:
         return "[LLM FALLBACK] Gemini 응답이 비어 있어 안전한 기본 응답을 반환합니다."
 
     except Exception as e:
+        error_text = str(e)
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+            if safety_mode:
+                return "[LLM RATE LIMIT FALLBACK] Gemini quota 초과로 안전 모드 기본 응답을 반환합니다. 구체적 절차 대신 예방·법적 유의사항 중심으로 안내합니다."
+            return "[LLM RATE LIMIT FALLBACK] Gemini quota 초과로 기본 데모 응답을 반환합니다. 잠시 후 다시 시도하거나 GEMINI_MODEL을 다른 Flash-Lite 모델로 변경하세요."
         if safety_mode:
             return "[LLM ERROR FALLBACK] 안전 모드: 구체적 절차 대신 일반적 예방·법적 유의사항 중심으로 안내합니다."
-        return f"[LLM ERROR FALLBACK] Gemini 호출 실패: {e}"
+        return f"[LLM ERROR FALLBACK] Gemini 호출 실패: {error_text[:300]}"
 
 
 def orange_layer(user_input: str, raw_response: str) -> Tuple[str, str]:
@@ -320,7 +335,14 @@ def process_user_message(user_input: str, state: SessionState) -> str:
     state.cumulative_score = DECAY * state.cumulative_score + turn_score
 
     # ORANGE
-    raw_response = call_main_llm(user_input)
+    semantic_risk = any(kw in user_input for kw in RISK_KEYWORDS)
+    procedural_request = any(kw in user_input for kw in TOOL_KEYWORDS)
+
+    if semantic_risk and procedural_request:
+        raw_response = ""
+    else:
+        raw_response = call_main_llm(user_input, safety_mode=semantic_risk)
+
     final_response, action = orange_layer(user_input, raw_response)
 
     layer = "ORANGE" if action != "PASS" else "GREEN"
@@ -394,7 +416,11 @@ with right:
         st.error("RED: Human Review Required")
 
     st.write("**Session Info**")
-    st.code(f"User ID: {state.user_id}\nSession ID: {state.session_id}")
+    st.code(
+        f"User ID: {state.user_id}\n"
+        f"Session ID: {state.session_id}\n"
+        f"Gemini Model: {get_gemini_model()}"
+    )
 
     if state.logs:
         st.write("**Latest Turn Scores**")
